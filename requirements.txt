@@ -5,6 +5,4 @@ opencv-python>=4.8.0     # Video I/O and display
 numpy>=1.24.0
 scipy>=1.10.0            # Savitzky-Golay filter
 matplotlib>=3.7.0        # Plots
-
-# Optional: for downloading barbell-specific models from Roboflow
-# roboflow
+roboflow>=1.1.0          # Model download from Roboflow (used by download_roboflow_model.py)

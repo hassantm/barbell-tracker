@@ -1,0 +1,17 @@
+# macOS
+.DS_Store
+
+# Video input/output
+input/
+output/
+
+# Model weights
+*.pt
+models/
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.env
