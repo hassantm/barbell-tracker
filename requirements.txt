@@ -1,0 +1,10 @@
+# Barbell Tracker dependencies
+ultralytics>=8.0.0       # YOLO detection + ByteTrack
+supervision>=0.20.0      # Detection utilities and annotators
+opencv-python>=4.8.0     # Video I/O and display
+numpy>=1.24.0
+scipy>=1.10.0            # Savitzky-Golay filter
+matplotlib>=3.7.0        # Plots
+
+# Optional: for downloading barbell-specific models from Roboflow
+# roboflow
