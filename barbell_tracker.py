@@ -421,6 +421,43 @@ def track_video(
 # Rep segmentation & analysis
 # ---------------------------------------------------------------------------
 
+def find_concentric_end(
+    ys_smooth: np.ndarray,
+    start_idx: int,
+    end_idx: int,
+    fps: float,
+    settle_frames: int = 5,
+    settle_px_per_frame: float = 3.0,
+) -> int:
+    """
+    Find the true end of the concentric (ascent) phase.
+
+    Rather than locating the top of the lift geometrically (unreliable when
+    the bar moves around at lockout), we detect when the bar *settles* —
+    defined as the first point where per-frame speed stays below
+    `settle_px_per_frame` for `settle_frames` consecutive frames.
+
+    `settle_frames` default of 5 = ~167ms at 30fps, ~83ms at 60fps.
+    `settle_px_per_frame` of 3.0px is well below meaningful bar movement
+    but above detection noise.
+
+    Falls back to end_idx if no settle point is found.
+    """
+    segment = ys_smooth[start_idx : end_idx + 1]
+    if len(segment) < settle_frames + 2:
+        return end_idx
+
+    abs_vel = np.abs(np.diff(segment))
+    slow    = abs_vel < settle_px_per_frame
+
+    # Slide a window looking for settle_frames consecutive slow frames
+    for i in range(len(slow) - settle_frames + 1):
+        if slow[i : i + settle_frames].all():
+            return start_idx + i  # first frame of the settled window
+
+    return end_idx
+
+
 def segment_and_analyse(
     raw_data: list,
     calibration: CalibrationResult,
@@ -480,7 +517,12 @@ def segment_and_analyse(
     for i in range(0, len(breakpoints) - 2, 2):
         start = breakpoints[i]
         mid   = breakpoints[i + 1] if (i + 1) < len(breakpoints) else len(ys) - 1
-        end   = breakpoints[i + 2] if (i + 2) < len(breakpoints) else len(ys) - 1
+        raw_end = breakpoints[i + 2] if (i + 2) < len(breakpoints) else len(ys) - 1
+
+        # Trim the ascent to where the bar reaches its highest point
+        # (minimum y in image coords) rather than the next reversal,
+        # which would include the rest period between reps.
+        end = find_concentric_end(ys_smooth, mid, raw_end, fps)
 
         rep_num += 1
         rd = RepData(rep_number=rep_num)
