@@ -4,8 +4,8 @@ barbell_tracker.py
 ------------------
 Track barbell bar path, velocity, and tilt from lifting video.
 Uses a Roboflow barbell-specific model that detects two classes:
-  - 'plate'  → bounding box used for position tracking and auto-calibration
-  - 'bar'    → centroid used to compute bar tilt angle
+  - 'End'      → plate end of barbell, used for position tracking and auto-calibration
+  - 'Barbell'  → bar body centroid, used to compute bar tilt angle
 
 Usage:
     python barbell_tracker.py --video path/to/video.mp4
@@ -56,9 +56,11 @@ ROBOFLOW_FORMAT    = "yolov8"
 
 DEFAULT_MODEL_PATH = "./models/barbells-detector/weights/best.pt"
 
-# Class names expected from the barbells-detector model
-CLASS_PLATE = "plate"
-CLASS_BAR   = "bar"
+# Class names from the barbells-detector model
+# 'Barbell' = bar body — primary tracking target (detected reliably in side-on footage)
+# 'End' = plate end — used for tilt angle when detected (lower confidence in practice)
+CLASS_PLATE = "Barbell"
+CLASS_BAR   = "End"
 
 # Number of frames to average for auto-calibration
 CALIBRATION_FRAMES = 10
@@ -208,6 +210,7 @@ def track_video(
     plate_diameter_mm: float,
     fps: float,
     smooth_window: int,
+    min_rep_amplitude_px: int,
     output_dir: Path,
 ):
     """
@@ -267,9 +270,14 @@ def track_video(
     if plate_class_id is None:
         print(f"WARNING: '{CLASS_PLATE}' class not found in model. "
               f"Available: {list(model.names.values())}")
+        # Fall back: use bar class as primary position signal
+        if bar_class_id is not None:
+            print(f"  → Falling back to '{CLASS_BAR}' as primary tracking target. "
+                  f"Auto-calibration unavailable; use --no-calibrate.")
+            plate_class_id = bar_class_id
+            bar_class_id = None
     if bar_class_id is None:
-        print(f"WARNING: '{CLASS_BAR}' class not found in model. "
-              f"Tilt calculation will be skipped.")
+        print(f"NOTE: '{CLASS_BAR}' class not found — tilt calculation skipped.")
 
     # Path points for trail drawing (plate centroids)
     path_points = []
@@ -404,7 +412,8 @@ def track_video(
         return None
 
     # --- Segment reps and compute metrics ---
-    reps = segment_and_analyse(raw_data, calibration, fps, smooth_window)
+    reps = segment_and_analyse(raw_data, calibration, fps, smooth_window,
+                               min_rep_amplitude_px=min_rep_amplitude_px)
     return reps, calibration, out_path
 
 
@@ -417,6 +426,7 @@ def segment_and_analyse(
     calibration: CalibrationResult,
     fps: float,
     smooth_window: int,
+    min_rep_amplitude_px: int = 60,
 ) -> list:
     """
     Split the plate y-position signal into reps by finding direction reversals.
@@ -446,8 +456,9 @@ def segment_and_analyse(
     dy           = np.diff(ys_smooth)
     sign_changes = np.where(np.diff(np.sign(dy)))[0] + 1
 
-    # Filter out tiny wiggles: require movement of at least 10 px
-    MIN_AMPLITUDE_PX = 10
+    # Filter out tiny wiggles: require minimum vertical travel
+    # Default 60px is roughly 10-15% of frame height — filters jitter while keeping real reps
+    MIN_AMPLITUDE_PX = min_rep_amplitude_px
     filtered = []
     for idx in sign_changes:
         if not filtered:
@@ -530,6 +541,15 @@ def segment_and_analyse(
             rd.__dict__["mean_bar_tilt_degrees"] = round(float(np.mean(ascent_tilts)), 2)
         else:
             rd.__dict__["mean_bar_tilt_degrees"] = None
+
+        # --- Rep duration by phase ---
+        t_arr = np.array(rd.timestamps_s)
+        phases = np.array(rd.phase)
+        descent_times = t_arr[phases == "descent"]
+        ascent_times  = t_arr[phases == "ascent"]
+        rd.__dict__["descent_duration_s"] = round(float(descent_times[-1] - descent_times[0]), 2) if len(descent_times) > 1 else None
+        rd.__dict__["ascent_duration_s"]  = round(float(ascent_times[-1]  - ascent_times[0]),  2) if len(ascent_times)  > 1 else None
+        rd.__dict__["total_duration_s"]   = round(float(t_arr[-1] - t_arr[0]), 2) if len(t_arr) > 1 else None
 
         reps.append(rd)
 
@@ -780,6 +800,9 @@ def save_summary(
             "mean_concentric_velocity_ms":  rep.__dict__.get("mean_concentric_velocity"),
             "peak_concentric_velocity_ms":  rep.__dict__.get("peak_concentric_velocity"),
             "mean_bar_tilt_degrees":        rep.__dict__.get("mean_bar_tilt_degrees"),
+            "descent_duration_s":           rep.__dict__.get("descent_duration_s"),
+            "ascent_duration_s":            rep.__dict__.get("ascent_duration_s"),
+            "total_duration_s":             rep.__dict__.get("total_duration_s"),
             "frame_count":                  len(rep.frame_indices),
         })
 
@@ -821,6 +844,9 @@ def parse_args():
     parser.add_argument("--smooth-window",
                         type=int, default=9,
                         help="Savitzky-Golay smoothing window in frames (odd int, default: 9)")
+    parser.add_argument("--min-rep-amplitude",
+                        type=int, default=60,
+                        help="Minimum vertical travel in pixels to count as a rep direction change (default: 60)")
     parser.add_argument("--list-classes",
                         action="store_true",
                         help="Print all class IDs/names for the chosen model and exit")
@@ -866,8 +892,9 @@ def main():
         no_calibrate     = args.no_calibrate,
         plate_diameter_mm= args.plate_diameter,
         fps              = fps,
-        smooth_window    = args.smooth_window,
-        output_dir       = output_dir,
+        smooth_window         = args.smooth_window,
+        min_rep_amplitude_px  = args.min_rep_amplitude,
+        output_dir            = output_dir,
     )
 
     if result is None:
@@ -882,18 +909,23 @@ def main():
 
     # --- Console rep summary ---
     print("\n=== Rep Summary ===")
-    print(f"{'Rep':>4}  {'Frames':>7}  {'MCV (m/s)':>10}  "
-          f"{'Peak (m/s)':>11}  {'Tilt (°)':>9}")
-    print("-" * 52)
+    print(f"{'Rep':>4}  {'Down (s)':>9}  {'Up (s)':>7}  {'MCV (m/s)':>10}  "
+          f"{'Peak (m/s)':>11}  {'Ready?':>7}")
+    print("-" * 58)
     for rep in reps:
-        mcv   = rep.__dict__.get("mean_concentric_velocity")
-        peak  = rep.__dict__.get("peak_concentric_velocity")
-        tilt  = rep.__dict__.get("mean_bar_tilt_degrees")
+        mcv     = rep.__dict__.get("mean_concentric_velocity")
+        peak    = rep.__dict__.get("peak_concentric_velocity")
+        down    = rep.__dict__.get("descent_duration_s")
+        up      = rep.__dict__.get("ascent_duration_s")
+        # "ready to go up" heuristic: concentric under 2s
+        ready   = "✓ YES" if (up is not None and up < 2.0) else ("  no" if up is not None else "  n/a")
         print(
-            f"{rep.rep_number:>4}  {len(rep.frame_indices):>7}  "
+            f"{rep.rep_number:>4}  "
+            f"{str(round(down, 2)) if down is not None else 'n/a':>9}  "
+            f"{str(round(up, 2)) if up is not None else 'n/a':>7}  "
             f"{str(round(mcv, 3)) if mcv is not None else 'n/a':>10}  "
             f"{str(round(peak, 3)) if peak is not None else 'n/a':>11}  "
-            f"{str(round(tilt, 1)) if tilt is not None else 'n/a':>9}"
+            f"{ready:>7}"
         )
 
     # Collect raw_data for tilt plotting (rebuild from reps)
