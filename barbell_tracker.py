@@ -428,34 +428,39 @@ def find_concentric_end(
     fps: float,
     settle_frames: int = 5,
     settle_px_per_frame: float = 3.0,
+    max_concentric_s: float = 4.0,
 ) -> int:
     """
     Find the true end of the concentric (ascent) phase.
 
-    Rather than locating the top of the lift geometrically (unreliable when
-    the bar moves around at lockout), we detect when the bar *settles* —
-    defined as the first point where per-frame speed stays below
-    `settle_px_per_frame` for `settle_frames` consecutive frames.
-
-    `settle_frames` default of 5 = ~167ms at 30fps, ~83ms at 60fps.
-    `settle_px_per_frame` of 3.0px is well below meaningful bar movement
-    but above detection noise.
-
-    Falls back to end_idx if no settle point is found.
+    Strategy:
+    1. Hard cap: no concentric exceeds max_concentric_s — constrains the
+       search window so we never bleed far into rest time.
+    2. Post-peak settle: within the capped window, find the first point
+       after peak velocity where the bar stays slow for settle_frames
+       consecutive frames.  Searching post-peak avoids false triggers at
+       sticking points.
+    3. If settle is never found within the cap, return the capped end.
     """
-    segment = ys_smooth[start_idx : end_idx + 1]
+    max_frames  = int(max_concentric_s * fps)
+    capped_end  = min(start_idx + max_frames, end_idx)
+
+    segment = ys_smooth[start_idx : capped_end + 1]
     if len(segment) < settle_frames + 2:
-        return end_idx
+        return capped_end
 
     abs_vel = np.abs(np.diff(segment))
     slow    = abs_vel < settle_px_per_frame
 
-    # Slide a window looking for settle_frames consecutive slow frames
-    for i in range(len(slow) - settle_frames + 1):
-        if slow[i : i + settle_frames].all():
-            return start_idx + i  # first frame of the settled window
+    # Only look for settle after peak velocity to skip sticking points
+    peak_offset  = int(np.argmax(abs_vel))
+    search_start = peak_offset + 1
 
-    return end_idx
+    for i in range(search_start, len(slow) - settle_frames + 1):
+        if slow[i : i + settle_frames].all():
+            return start_idx + i
+
+    return capped_end
 
 
 def segment_and_analyse(
