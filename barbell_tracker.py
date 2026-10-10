@@ -212,6 +212,8 @@ def track_video(
     smooth_window: int,
     min_rep_amplitude_px: int,
     output_dir: Path,
+    headless: bool = False,
+    settle_fraction: float = 0.15,
 ):
     """
     Main tracking loop.
@@ -282,9 +284,11 @@ def track_video(
     # Path points for trail drawing (plate centroids)
     path_points = []
 
-    print("Tracking... (press Q in the preview window to stop early)\n")
-
-    cv2.namedWindow("Barbell Tracker", cv2.WINDOW_NORMAL)
+    if not headless:
+        print("Tracking... (press Q in the preview window to stop early)\n")
+        cv2.namedWindow("Barbell Tracker", cv2.WINDOW_NORMAL)
+    else:
+        print("Tracking (headless)...")
 
     tracker_args = dict(
         source=video_path,
@@ -388,13 +392,18 @@ def track_video(
                     0.55, (200, 200, 200), 1)
 
         writer.write(frame)
-        cv2.imshow("Barbell Tracker", frame)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            print("Stopped early by user.")
-            break
+        if not headless:
+            cv2.imshow("Barbell Tracker", frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                print("Stopped early by user.")
+                break
+        elif frame_idx % 50 == 0:
+            pct = int(100 * frame_idx / total_frames) if total_frames else 0
+            print(f"  Frame {frame_idx}/{total_frames} ({pct}%)", flush=True)
 
     writer.release()
-    cv2.destroyAllWindows()
+    if not headless:
+        cv2.destroyAllWindows()
     print(f"\nAnnotated video saved: {out_path}")
 
     # --- Finalise calibration ---
@@ -413,7 +422,8 @@ def track_video(
 
     # --- Segment reps and compute metrics ---
     reps = segment_and_analyse(raw_data, calibration, fps, smooth_window,
-                               min_rep_amplitude_px=min_rep_amplitude_px)
+                               min_rep_amplitude_px=min_rep_amplitude_px,
+                               settle_fraction=settle_fraction)
     return reps, calibration, out_path
 
 
@@ -429,6 +439,9 @@ def find_concentric_end(
     settle_frames: int = 5,
     settle_px_per_frame: float = 3.0,
     max_concentric_s: float = 4.0,
+    settle_fraction: float = 0.15,
+    max_settle_displacement_px: float = 8.0,
+    verbose: bool = False,
 ) -> int:
     """
     Find the true end of the concentric (ascent) phase.
@@ -438,9 +451,11 @@ def find_concentric_end(
        search window so we never bleed far into rest time.
     2. Post-peak settle: within the capped window, find the first point
        after peak velocity where the bar stays slow for settle_frames
-       consecutive frames.  Searching post-peak avoids false triggers at
-       sticking points.
-    3. If settle is never found within the cap, return the capped end.
+       consecutive frames AND the net displacement over that window is
+       small (true lockout, not a sticking point mid-lift).
+    3. Adaptive threshold: settle speed = max(mean_vel * settle_fraction, 1.5)
+       so a heavy slow single uses a tighter threshold than a fast set.
+    4. If settle is never found within the cap, return the capped end.
     """
     max_frames  = int(max_concentric_s * fps)
     capped_end  = min(start_idx + max_frames, end_idx)
@@ -450,15 +465,32 @@ def find_concentric_end(
         return capped_end
 
     abs_vel = np.abs(np.diff(segment))
-    slow    = abs_vel < settle_px_per_frame
+
+    # Adaptive settle threshold: fraction of mean velocity, floored at 1.5 px/frame
+    mean_vel       = float(np.mean(abs_vel))
+    adaptive_settle = max(mean_vel * settle_fraction, 1.5)
+    slow           = abs_vel < adaptive_settle
 
     # Only look for settle after peak velocity to skip sticking points
     peak_offset  = int(np.argmax(abs_vel))
     search_start = peak_offset + 1
 
+    found_offset = None
     for i in range(search_start, len(slow) - settle_frames + 1):
         if slow[i : i + settle_frames].all():
-            return start_idx + i
+            # Confirm near-zero net displacement (true lockout, not sticking point)
+            window_displacement = abs(float(segment[i + settle_frames]) - float(segment[i]))
+            if window_displacement < max_settle_displacement_px:
+                found_offset = i
+                break
+
+    if verbose:
+        result_label = f"frame offset {found_offset}" if found_offset is not None else "cap"
+        print(f"  [concentric_end] mean_vel={mean_vel:.2f} adaptive_settle={adaptive_settle:.2f} "
+              f"detected at {result_label}")
+
+    if found_offset is not None:
+        return start_idx + found_offset
 
     return capped_end
 
@@ -469,6 +501,7 @@ def segment_and_analyse(
     fps: float,
     smooth_window: int,
     min_rep_amplitude_px: int = 60,
+    settle_fraction: float = 0.15,
 ) -> list:
     """
     Split the plate y-position signal into reps by finding direction reversals.
@@ -527,7 +560,8 @@ def segment_and_analyse(
         # Trim the ascent to where the bar reaches its highest point
         # (minimum y in image coords) rather than the next reversal,
         # which would include the rest period between reps.
-        end = find_concentric_end(ys_smooth, mid, raw_end, fps)
+        end = find_concentric_end(ys_smooth, mid, raw_end, fps,
+                                   settle_fraction=settle_fraction)
 
         rep_num += 1
         rd = RepData(rep_number=rep_num)
@@ -897,6 +931,13 @@ def parse_args():
     parser.add_argument("--list-classes",
                         action="store_true",
                         help="Print all class IDs/names for the chosen model and exit")
+    parser.add_argument("--headless",
+                        action="store_true",
+                        help="Suppress preview window (for Pi / display-less environments)")
+    parser.add_argument("--settle-fraction",
+                        type=float, default=0.15,
+                        help="Adaptive settle threshold as fraction of mean velocity "
+                             "(default: 0.15; lower = tighter, higher = more lenient)")
 
     # Legacy flag kept for backwards compatibility (was used with old class filtering)
     parser.add_argument("--class-ids",
@@ -933,15 +974,17 @@ def main():
 
     # --- Track ---
     result = track_video(
-        video_path       = args.video,
-        model            = model,
-        conf             = args.conf,
-        no_calibrate     = args.no_calibrate,
-        plate_diameter_mm= args.plate_diameter,
-        fps              = fps,
-        smooth_window         = args.smooth_window,
-        min_rep_amplitude_px  = args.min_rep_amplitude,
-        output_dir            = output_dir,
+        video_path           = args.video,
+        model                = model,
+        conf                 = args.conf,
+        no_calibrate         = args.no_calibrate,
+        plate_diameter_mm    = args.plate_diameter,
+        fps                  = fps,
+        smooth_window        = args.smooth_window,
+        min_rep_amplitude_px = args.min_rep_amplitude,
+        output_dir           = output_dir,
+        headless             = args.headless,
+        settle_fraction      = args.settle_fraction,
     )
 
     if result is None:
